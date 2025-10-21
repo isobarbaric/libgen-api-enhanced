@@ -209,25 +209,49 @@ class SearchRequest:
 
     def get_books(self, table):
         for row in table.find_all("tr"):
-            # try:
             tds = row.find_all("td")
             if len(tds) < 9:
                 continue
 
-            title_links = tds[0].find_all("a")
+            title_links = tds[0].find_all("a", href=True)
             if not title_links:
                 continue
 
-            title = re.sub(r"[^A-Za-z0-9 ]+", "", title_links[0].text.strip())
-            id_param = parse_qs(urlparse(title_links[0]["href"]).query).get("id", [""])[
-                0
+            visible_links = [
+                (a.get_text(strip=True), a) for a in title_links if a.get_text(strip=True)
             ]
+            if not visible_links:
+                continue
+            visible_links.sort(key=lambda x: len(x[0]), reverse=True)
+            title_text, title_link = visible_links[0]
+            title = re.sub(r"\s+", " ", title_text).strip()
+
+            id_param = ""
+            for link in [title_link] + title_links:
+                href = link.get("href", "")
+                parsed = urlparse(href)
+                if parsed.path.endswith("edition.php") or "edition.php" in parsed.path:
+                    id_param = parse_qs(parsed.query).get("id", [""])[0]
+                    if id_param:
+                        break
+            if not id_param:
+                for link in title_links:
+                    q = parse_qs(urlparse(link.get("href", "")).query)
+                    if q.get("id", [""])[0]:
+                        id_param = q["id"][0]
+                        break
 
             author = tds[1].get_text(strip=True)
             publisher = tds[2].get_text(strip=True)
-            year = tds[3].get_text(strip=True)
+            # Normalize year to digits when present
+            raw_year = tds[3].get_text(strip=True)
+            m_year = re.search(r"\d{4}", raw_year) if raw_year else None
+            year = m_year.group(0) if m_year else raw_year
             language = tds[4].get_text(strip=True)
-            pages = tds[5].get_text(strip=True)
+            # Pages: prefer digits if any
+            raw_pages = tds[5].get_text(strip=True)
+            m_pages = re.search(r"\d+", raw_pages) if raw_pages else None
+            pages = m_pages.group(0) if m_pages else raw_pages
 
             size_link = tds[6].find("a")
             size = (
@@ -242,11 +266,36 @@ class SearchRequest:
             mirrors = self.get_mirrors(mirror_links[:4])
 
             md5 = ""
-            if mirrors[0]:
-                md5 = parse_qs(urlparse(mirrors[0]).query).get("md5", [""])[0]
+            hex32 = re.compile(r"[A-Fa-f0-9]{32}")
+            for a in mirror_links:
+                href = a.get("href", "").strip()
+                if not href:
+                    continue
+                parsed = urlparse(href)
+                q_md5 = parse_qs(parsed.query).get("md5", [""])[0]
+                if q_md5 and hex32.fullmatch(q_md5):
+                    md5 = q_md5
+                    break
+                m = hex32.search(parsed.path)
+                if m:
+                    md5 = m.group(0)
+                    break
+            if not md5 and mirrors and mirrors[0]:
+                parsed0 = urlparse(mirrors[0])
+                md5 = parse_qs(parsed0.query).get("md5", [""])[0] or (
+                    re.search(hex32, parsed0.path).group(0) if re.search(hex32, parsed0.path) else ""
+                )
 
+            # Dates: extract from tooltip title in the first cell if available
             date_added = ""
             date_last_modified = ""
+            tooltip_link = tds[0].find("a", attrs={"title": True})
+            if tooltip_link is not None:
+                tooltip = tooltip_link.get("title", "")
+                # Expected: "Add/Edit : YYYY-MM-DD/YYYY-MM-DD; ID: ..."
+                m = re.search(r"Add/Edit\s*:\s*(\d{4}-\d{2}-\d{2})/(\d{4}-\d{2}-\d{2})", tooltip)
+                if m:
+                    date_added, date_last_modified = m.group(1), m.group(2)
 
             yield Book(
                 id_param,
@@ -305,6 +354,16 @@ class SearchRequest:
             soup = BeautifulSoup(search_page.text, "html.parser")
             self.strip_i_tag_from_soup(soup)
             table = soup.find("table", {"id": "tablelibgen"})
+            if table is None:
+                # Fallback: pick the first table that looks like results
+                tables = soup.find_all("table")
+                hex32 = re.compile(r"[A-Fa-f0-9]{32}")
+                for t in tables:
+                    if t.find("a", href=re.compile(r"ads\\.php\\?md5=")) or t.find(
+                        "a", href=hex32
+                    ):
+                        table = t
+                        break
             if table is None:
                 self._logger.warning("No results table found on search page")
             return table
